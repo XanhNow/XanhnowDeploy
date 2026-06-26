@@ -1,0 +1,30 @@
+name: API_Deploy Runner Smoke
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: api-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify-runner:
+    runs-on: [self-hosted, linux, x64, api-deploy]
+
+    steps:
+      - name: Checkout private deploy repository
+        uses: actions/checkout@v4
+
+      - name: Verify build and deployment prerequisites
+        shell: bash
+        run: |
+          dotnet --list-sdks
+          git --version
+
+          ssh -o BatchMode=yes api-1 'hostname -s'
+          ssh -o BatchMode=yes api-2 'hostname -s'
+          ssh -o BatchMode=yes api-3 'hostname -s'
+
