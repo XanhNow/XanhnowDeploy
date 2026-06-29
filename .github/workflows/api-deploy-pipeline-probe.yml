@@ -1,0 +1,113 @@
+name: API Deploy Pipeline Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-deploy
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: [self-hosted, linux, x64, api-deploy]
+
+    steps:
+      - name: Checkout private deploy repository
+        uses: actions/checkout@v4
+
+      - name: Verify GitHub runner can build and publish .NET 10
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          test "$(hostname -s)" = "hungangu"
+          dotnet --list-sdks | grep -Eq '^10\.'
+          git --version
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          dotnet new web \
+            --framework net10.0 \
+            --no-restore \
+            --output "$TMP_DIR/RunnerProbe"
+
+          dotnet restore "$TMP_DIR/RunnerProbe/RunnerProbe.csproj"
+
+          dotnet build \
+            "$TMP_DIR/RunnerProbe/RunnerProbe.csproj" \
+            --configuration Release \
+            --no-restore
+
+          dotnet publish \
+            "$TMP_DIR/RunnerProbe/RunnerProbe.csproj" \
+            --configuration Release \
+            --no-build \
+            --output "$TMP_DIR/publish"
+
+          test -f "$TMP_DIR/publish/RunnerProbe.dll"
+
+          echo "RUNNER_BUILD_PUBLISH=PASS"
+
+      - name: Verify pinned SSH and SCP to all API nodes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          NODES=(api-1 api-2 api-3)
+          SSH_OPTIONS=(
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+          )
+
+          PROBE_FILE="$(mktemp)"
+          REMOTE_PREFIX="/tmp/gha-scp-probe-${GITHUB_RUN_ID:-manual}-$$"
+
+          cleanup() {
+            rm -f "$PROBE_FILE"
+
+            for NODE in "${NODES[@]}"; do
+              ssh "${SSH_OPTIONS[@]}" "$NODE" \
+                "rm -f '${REMOTE_PREFIX}-${NODE}'" \
+                >/dev/null 2>&1 || true
+            done
+          }
+
+          trap cleanup EXIT
+
+          printf 'XanhNow SCP probe | run=%s | utc=%s\n' \
+            "${GITHUB_RUN_ID:-manual}" \
+            "$(date -u +%FT%TZ)" > "$PROBE_FILE"
+
+          LOCAL_SHA="$(sha256sum "$PROBE_FILE" | awk '{print $1}')"
+
+          for NODE in "${NODES[@]}"; do
+            ACTUAL_HOST="$(
+              ssh "${SSH_OPTIONS[@]}" "$NODE" 'hostname -s'
+            )"
+
+            test "$ACTUAL_HOST" = "$NODE"
+
+            REMOTE_FILE="${REMOTE_PREFIX}-${NODE}"
+
+            scp "${SSH_OPTIONS[@]}" \
+              "$PROBE_FILE" \
+              "${NODE}:${REMOTE_FILE}"
+
+            REMOTE_SHA="$(
+              ssh "${SSH_OPTIONS[@]}" "$NODE" \
+                "sha256sum '${REMOTE_FILE}' | awk '{print \$1}'"
+            )"
+
+            test "$REMOTE_SHA" = "$LOCAL_SHA"
+
+            ssh "${SSH_OPTIONS[@]}" "$NODE" \
+              "rm -f '${REMOTE_FILE}'"
+
+            echo "SCP_PASS=${NODE}"
+          done
+
+          echo "SCP_AND_KNOWN_HOSTS=PASS"
