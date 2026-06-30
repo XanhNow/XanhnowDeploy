@@ -1,0 +1,416 @@
+# FILE: .github/workflows/deploy-xanhnow-api-one-node.yml
+#
+# Mục đích:
+# - Checkout source API, build/publish .NET, đóng gói artifact.
+# - Mỗi lần chạy chỉ deploy đúng một API node.
+# - Xác minh SHA256, chuyển symlink current, restart service.
+# - Kiểm tra readiness local và rollback khi release mới không healthy.
+#
+# Đây là GitHub Actions workflow YAML.
+# Không chạy trực tiếp file này trong PowerShell hoặc Linux terminal.
+# Không đặt password, token, private key, certificate hoặc connection string ở đây.
+
+name: Deploy XanhNow API - One Node
+
+# Cho phép chạy workflow thủ công từ tab Actions.
+on:
+  workflow_dispatch:
+    inputs:
+      # Tag, branch hoặc commit SHA đã được duyệt của source API.
+      source_ref:
+        description: "Approved source tag or commit SHA"
+        required: true
+        default: "main"
+        type: string
+
+      # Mỗi workflow run chỉ được deploy đúng một API node.
+      target_node:
+        description: "Deploy exactly one API node in this run"
+        required: true
+        type: choice
+        options:
+          - api-1
+          - api-2
+          - api-3
+
+# Workflow chỉ cần quyền đọc repository deploy.
+permissions:
+  contents: read
+
+# Không cho hai workflow thay đổi cùng một API node đồng thời.
+concurrency:
+  group: xanhnow-api-deploy-${{ inputs.target_node }}
+  cancel-in-progress: false
+
+# Biến dùng chung cho toàn bộ workflow.
+env:
+  # Phải khớp tên service và release layout đã tạo ở mục 5.2.
+  APP_ID: xanhnow-api
+
+  # Phải khớp chính xác DLL tạo ra sau dotnet publish.
+  APP_DLL: XanhNow.Api.dll
+
+  # Đường dẫn .csproj tính từ root của source repository.
+  PROJECT_FILE: src/XanhNow.Api/XanhNow.Api.csproj
+
+  # Bắt buộc thay REPLACE_WITH_SOURCE_REPOSITORY trước khi chạy.
+  # Dạng giá trị: XanhNow/ten-repository-api
+  SOURCE_REPOSITORY: XanhNow/REPLACE_WITH_SOURCE_REPOSITORY
+
+  # Port backend nội bộ đã được bootstrap trên ba API node.
+  API_PORT: "8080"
+
+  # Endpoint phải trả HTTP 200 sau deploy thành công.
+  READY_PATH: /api/health/ready
+
+jobs:
+  deploy:
+    # Bắt buộc chạy trên self-hosted runner API_Deploy.
+    runs-on: [self-hosted, linux, x64, api-deploy]
+
+    steps:
+      # ==========================================================
+      # A. TẠO GITHUB APP TOKEN - CHỈ CHẠY KHI SOURCE LÀ PRIVATE
+      # ==========================================================
+      - name: Create GitHub App token for private source
+        id: source_app
+        if: ${{ vars.XN_SOURCE_IS_PRIVATE == 'true' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          # GitHub repository variable: XN_SOURCE_APP_CLIENT_ID
+          client-id: ${{ vars.XN_SOURCE_APP_CLIENT_ID }}
+
+          # GitHub repository secret: XN_SOURCE_APP_PRIVATE_KEY
+          private-key: ${{ secrets.XN_SOURCE_APP_PRIVATE_KEY }}
+
+          # Source repository được giả định nằm cùng organization.
+          owner: ${{ github.repository_owner }}
+
+          # Token chỉ cần quyền đọc source code.
+          permission-contents: read
+
+      # Source private phải tạo được token trước khi checkout.
+      - name: Fail when private source checkout gate is incomplete
+        if: ${{ vars.XN_SOURCE_IS_PRIVATE == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "${{ steps.source_app.outputs.token }}"
+
+      # ==========================================================
+      # B. CHECKOUT SOURCE API
+      # ==========================================================
+      # Nhánh này chỉ chạy khi source API là private.
+      - name: Checkout approved private application source
+        if: ${{ vars.XN_SOURCE_IS_PRIVATE == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          path: source
+          token: ${{ steps.source_app.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      # Nhánh này chạy khi source API là public.
+      - name: Checkout approved public application source
+        if: ${{ vars.XN_SOURCE_IS_PRIVATE != 'true' }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+
+      # ==========================================================
+      # C. RESTORE, BUILD VÀ PUBLISH .NET APPLICATION
+      # ==========================================================
+      - name: Restore, build and publish .NET application
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Chặn workflow chạy nhầm trên runner khác API_Deploy.
+          test "$(hostname -s)" = "hungangu"
+
+          # Chặn chạy khi SOURCE_REPOSITORY còn placeholder.
+          case "${SOURCE_REPOSITORY}" in
+            *REPLACE*)
+              echo "FAIL: set SOURCE_REPOSITORY before running this workflow" >&2
+              exit 1
+              ;;
+          esac
+
+          # Project file phải tồn tại trong source đã checkout.
+          test -f "source/${PROJECT_FILE}"
+
+          # API_Deploy phải có .NET SDK 10.
+          dotnet --list-sdks | grep -Eq '^10[.]'
+
+          # Restore dependency.
+          dotnet restore "source/${PROJECT_FILE}"
+
+          # Build Release.
+          dotnet build "source/${PROJECT_FILE}" --configuration Release --no-restore
+
+          # Publish vào thư mục tạm trên runner.
+          dotnet publish \
+            "source/${PROJECT_FILE}" \
+            --configuration Release \
+            --no-build \
+            --output "${RUNNER_TEMP}/${APP_ID}-publish"
+
+          # DLL publish phải khớp APP_DLL.
+          test -f "${RUNNER_TEMP}/${APP_ID}-publish/${APP_DLL}"
+
+      # ==========================================================
+      # D. ĐÓNG GÓI ARTIFACT VÀ GHI SOURCE METADATA
+      # ==========================================================
+      - name: Package artifact and record source metadata
+        id: package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # SHA chính xác của source đã checkout.
+          SOURCE_SHA="$(git -C source rev-parse --verify HEAD)"
+
+          # Thời điểm build UTC và release ID duy nhất.
+          BUILT_UTC="$(date -u +%FT%TZ)"
+          RELEASE_ID="${SOURCE_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ARCHIVE="${RUNNER_TEMP}/${APP_ID}-${RELEASE_ID}.tgz"
+
+          # Đóng gói toàn bộ output dotnet publish.
+          tar \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "${RUNNER_TEMP}/${APP_ID}-publish" \
+            -czf "${ARCHIVE}" \
+            .
+
+          # Archive phải có dữ liệu.
+          test -s "${ARCHIVE}"
+
+          # SHA256 dùng để xác minh artifact tại API node.
+          SHA256="$(sha256sum "${ARCHIVE}" | awk '{print $1}')"
+
+          # Xuất metadata cho bước deploy.
+          echo "release_id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${ARCHIVE}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=${SHA256}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha=${SOURCE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "built_utc=${BUILT_UTC}" >> "${GITHUB_OUTPUT}"
+
+          echo "SOURCE_METADATA=PASS | SHA=${SOURCE_SHA} | RELEASE=${RELEASE_ID}"
+
+      # ==========================================================
+      # E. DEPLOY ĐÚNG MỘT API NODE
+      # ==========================================================
+      - name: Deploy selected API node only
+        shell: bash
+        env:
+          # Giá trị target_node do người chạy chọn trong Actions UI.
+          TARGET_NODE: ${{ inputs.target_node }}
+
+          # Metadata được tạo tại bước package.
+          RELEASE_ID: ${{ steps.package.outputs.release_id }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          EXPECTED_SHA: ${{ steps.package.outputs.sha256 }}
+          SOURCE_SHA: ${{ steps.package.outputs.source_sha }}
+          BUILT_UTC: ${{ steps.package.outputs.built_utc }}
+
+          # Ghi lại source ref được chọn vào release.json.
+          SOURCE_REF: ${{ inputs.source_ref }}
+
+        run: |
+          set -Eeuo pipefail
+
+          # Không chấp nhận target node ngoài ba API VM.
+          case "${TARGET_NODE}" in
+            api-1|api-2|api-3) ;;
+            *)
+              echo "FAIL: invalid target_node=${TARGET_NODE}" >&2
+              exit 1
+              ;;
+          esac
+
+          # Pipeline Probe phải đã chuẩn bị SSH key và known_hosts.
+          SSH_OPTIONS=(
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+          )
+
+          # Thư mục incoming đã được tạo ở mục 5.2.
+          REMOTE_ARCHIVE="/home/xanhnow/${APP_ID}/incoming/${RELEASE_ID}.tgz"
+
+          # SCP artifact từ API_Deploy sang đúng node được chọn.
+          scp "${SSH_OPTIONS[@]}" "${ARCHIVE}" "${TARGET_NODE}:${REMOTE_ARCHIVE}"
+
+          # Truyền tham số an toàn vào Bash chạy trên API node.
+          printf -v REMOTE_COMMAND \
+            'bash -s -- %q %q %q %q %q %q %q %q %q %q %q' \
+            "${TARGET_NODE}" \
+            "${APP_ID}" \
+            "${APP_DLL}" \
+            "${RELEASE_ID}" \
+            "${EXPECTED_SHA}" \
+            "${API_PORT}" \
+            "${READY_PATH}" \
+            "${SOURCE_REPOSITORY}" \
+            "${SOURCE_REF}" \
+            "${SOURCE_SHA}" \
+            "${BUILT_UTC}"
+
+          # ======================================================
+          # F. REMOTE DEPLOY SCRIPT - CHẠY TRÊN API NODE ĐÃ CHỌN
+          # ======================================================
+          ssh "${SSH_OPTIONS[@]}" "${TARGET_NODE}" "${REMOTE_COMMAND}" <<'REMOTE'
+          set -Eeuo pipefail
+
+          # Nhận tham số truyền từ API_Deploy.
+          TARGET_NODE="$1"
+          APP_ID="$2"
+          APP_DLL="$3"
+          RELEASE_ID="$4"
+          EXPECTED_SHA="$5"
+          API_PORT="$6"
+          READY_PATH="$7"
+          SOURCE_REPOSITORY="$8"
+          SOURCE_REF="$9"
+          SOURCE_SHA="${10}"
+          BUILT_UTC="${11}"
+
+          fail() {
+            echo "FAIL: $*" >&2
+            exit 1
+          }
+
+          # Bảo đảm đang deploy đúng API node đã chọn.
+          HOST="$(hostname -s)"
+          [ "$HOST" = "$TARGET_NODE" ] || fail "expected ${TARGET_NODE}; got ${HOST}"
+
+          # Các đường dẫn đã bootstrap tại mục 5.2.
+          BASE="$HOME/${APP_ID}"
+          ARCHIVE="${BASE}/incoming/${RELEASE_ID}.tgz"
+          RELEASE_DIR="${BASE}/releases/${RELEASE_ID}"
+          CURRENT_LINK="${BASE}/current"
+          PREVIOUS_LINK="${BASE}/previous"
+
+          # Các thành phần nền phải tồn tại trước deploy.
+          test -f "$HOME/.config/systemd/user/${APP_ID}.service"
+          test -f "${BASE}/config/runtime.env"
+          test -f "$ARCHIVE"
+
+          # Xác minh artifact không thay đổi/lỗi sau SCP.
+          ACTUAL_SHA="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+          [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || fail "artifact checksum mismatch"
+
+          # Lưu release hiện tại để rollback khi release mới lỗi.
+          PREVIOUS=""
+          if [ -L "$CURRENT_LINK" ]; then
+            PREVIOUS="$(readlink -f "$CURRENT_LINK")"
+            test -d "$PREVIOUS"
+          fi
+
+          # Tạo release folder mới và giải nén artifact.
+          rm -rf "$RELEASE_DIR"
+          install -d -m 0750 "$RELEASE_DIR"
+          tar -xzf "$ARCHIVE" -C "$RELEASE_DIR"
+
+          # DLL trong release phải đúng tên đã khai báo.
+          test -f "${RELEASE_DIR}/${APP_DLL}"
+
+          # Escape chuỗi trước khi ghi release.json.
+          json_escape() {
+            printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+          }
+
+          # Ghi release metadata sau khi checksum artifact PASS.
+          cat > "${RELEASE_DIR}/release.json" <<EOF
+          {
+            "app_id": "$(json_escape "$APP_ID")",
+            "release_id": "$(json_escape "$RELEASE_ID")",
+            "source_repository": "$(json_escape "$SOURCE_REPOSITORY")",
+            "source_ref": "$(json_escape "$SOURCE_REF")",
+            "source_sha": "$(json_escape "$SOURCE_SHA")",
+            "artifact_sha256": "$(json_escape "$EXPECTED_SHA")",
+            "built_utc": "$(json_escape "$BUILT_UTC")"
+          }
+          EOF
+
+          chmod 0640 "${RELEASE_DIR}/release.json"
+
+          # Chuyển symlink current sang release mới theo cách atomic.
+          rm -f "${BASE}/current.next"
+          ln -s "releases/${RELEASE_ID}" "${BASE}/current.next"
+          mv -Tf "${BASE}/current.next" "$CURRENT_LINK"
+
+          # Kết nối vào systemd user bus của user chạy remote script.
+          USER_UID="$(id -u)"
+          export XDG_RUNTIME_DIR="/run/user/${USER_UID}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+          test -S "${XDG_RUNTIME_DIR}/bus"
+
+          # Xóa trạng thái failed cũ trước khi restart service.
+          systemctl --user reset-failed "${APP_ID}.service" || true
+
+          # Restart service, chờ readiness tối đa 20 giây.
+          READY=0
+          if systemctl --user restart "${APP_ID}.service"; then
+            for _ in $(seq 1 20); do
+              if curl \
+                --noproxy "*" \
+                --fail \
+                --silent \
+                --show-error \
+                --connect-timeout 2 \
+                --max-time 5 \
+                "http://127.0.0.1:${API_PORT}${READY_PATH}"
+              then
+                READY=1
+                break
+              fi
+
+              sleep 1
+            done
+          fi
+
+          # Readiness fail thì rollback current về release trước.
+          if [ "$READY" -ne 1 ]; then
+            echo "FAIL: readiness failed after release switch" >&2
+
+            if [ -n "$PREVIOUS" ]; then
+              rm -f "${BASE}/current.rollback"
+              ln -s "$PREVIOUS" "${BASE}/current.rollback"
+              mv -Tf "${BASE}/current.rollback" "$CURRENT_LINK"
+              systemctl --user restart "${APP_ID}.service" || true
+            else
+              # First deploy fail: stop service, bỏ symlink current,
+              # giữ release để phân tích lỗi.
+              systemctl --user stop "${APP_ID}.service" || true
+              rm -f "$CURRENT_LINK"
+              echo "FIRST_DEPLOY_FAILED | HOST=${HOST} | release kept for analysis" >&2
+            fi
+
+            exit 1
+          fi
+
+          # Chỉ cập nhật previous khi release mới readiness PASS.
+          if [ -n "$PREVIOUS" ]; then
+            rm -f "${BASE}/previous.next"
+            ln -s "$PREVIOUS" "${BASE}/previous.next"
+            mv -Tf "${BASE}/previous.next" "$PREVIOUS_LINK"
+          fi
+
+          # Xóa archive sau khi deploy thành công.
+          rm -f "$ARCHIVE"
+
+          echo "DEPLOY_NODE=PASS | HOST=${HOST} | RELEASE=${RELEASE_ID} | SOURCE_SHA=${SOURCE_SHA}"
+          REMOTE
+
+          # Marker PASS cuối cùng của workflow.
+          echo "SINGLE_NODE_DEPLOY=PASS | TARGET=${TARGET_NODE} | RELEASE=${RELEASE_ID} | SOURCE_SHA=${SOURCE_SHA}"
