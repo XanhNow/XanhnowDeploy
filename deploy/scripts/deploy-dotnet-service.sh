@@ -130,6 +130,13 @@ RELEASE_DIR="${BASE_DIR}/releases/${RELEASE_ID}"
 CURRENT_LINK="${BASE_DIR}/current"
 PREVIOUS_TARGET=""
 if [[ -L "$CURRENT_LINK" ]]; then PREVIOUS_TARGET="$(readlink -f "$CURRENT_LINK")"; fi
+if [[ -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+  if [[ -d "$CURRENT_LINK" && -z "$(find "$CURRENT_LINK" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    rmdir "$CURRENT_LINK"
+  else
+    fail "current path exists but is not a symlink or empty directory: $CURRENT_LINK"
+  fi
+fi
 
 install -d -m 0755 "$BASE_DIR" "${BASE_DIR}/releases"
 rm -rf "$RELEASE_DIR"
