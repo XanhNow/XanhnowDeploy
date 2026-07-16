@@ -10,6 +10,24 @@ dotnet --list-sdks | grep -Eq '^10\.'
 APPS="$(resolve_apps)"
 SOURCE_REF="${SOURCE_REF:-main}"
 
+dotnet_restore_with_retry() {
+  local project_file="$1"
+
+  for attempt in 1 2 3 4; do
+    echo "DOTNET_RESTORE_ATTEMPT=${attempt} | project=${project_file}"
+
+    if dotnet restore "$project_file" --disable-parallel; then
+      return 0
+    fi
+
+    dotnet nuget locals http-cache --clear || true
+    sleep $((attempt * 10))
+  done
+
+  echo "FAIL: dotnet restore failed after retries: ${project_file}" >&2
+  return 1
+}
+
 for APP in $APPS; do
   REPO="$(source_repo_for_app "$APP")"
   SOURCE_DIR="${RUNNER_TEMP:-/tmp}/source-${APP}"
@@ -22,7 +40,7 @@ for APP in $APPS; do
     PUBLISH_DIR="${RUNNER_TEMP:-/tmp}/publish-${COMPONENT}"
 
     test -f "${SOURCE_DIR}/${PROJECT_FILE}"
-    dotnet restore "${SOURCE_DIR}/${PROJECT_FILE}"
+    dotnet_restore_with_retry "${SOURCE_DIR}/${PROJECT_FILE}"
     dotnet build "${SOURCE_DIR}/${PROJECT_FILE}" --configuration Release --no-restore
     rm -rf "$PUBLISH_DIR"
     dotnet publish "${SOURCE_DIR}/${PROJECT_FILE}" --configuration Release --no-build --output "$PUBLISH_DIR"
