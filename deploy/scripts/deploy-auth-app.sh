@@ -7,6 +7,9 @@ source "${SCRIPT_DIR}/auth-app-catalog.sh"
 test "$(hostname -s)" = "hungangu"
 dotnet --list-sdks | grep -Eq '^10\.'
 
+export NUGET_PACKAGES="${NUGET_PACKAGES:-/home/gha-runner/.nuget/packages}"
+mkdir -p "$NUGET_PACKAGES"
+
 APPS="$(resolve_apps)"
 NODES="$(resolve_nodes)"
 SOURCE_REF="${SOURCE_REF:-main}"
@@ -21,7 +24,6 @@ dotnet_restore_with_retry() {
       return 0
     fi
 
-    dotnet nuget locals http-cache --clear || true
     sleep $((attempt * 10))
   done
 
