@@ -28,7 +28,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: auth-app-deploy-${{ inputs.app }}-${{ inputs.target_nodes }}
+  group: auth-app-deploy
   cancel-in-progress: false
 
 jobs:
