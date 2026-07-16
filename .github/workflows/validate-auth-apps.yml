@@ -1,10 +1,10 @@
-name: Deploy Auth App
+name: Validate Auth App Sources
 
 on:
   workflow_dispatch:
     inputs:
       app:
-        description: "Auth app to deploy"
+        description: "Auth app to validate"
         required: true
         type: choice
         options:
@@ -12,43 +12,36 @@ on:
           - auth-login
           - passkey-provider
           - smart-otp
+          - all
       source_ref:
         description: "Source branch, tag, or commit SHA"
         required: true
         default: "main"
-        type: string
-      target_nodes:
-        description: "Target nodes: api-1, api-2, api-3, or comma-separated list"
-        required: true
-        default: "api-1"
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: deploy-auth-app
+  group: validate-auth-apps
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  validate:
     runs-on: [self-hosted, linux, x64, api-deploy]
 
     steps:
       - name: Checkout deploy repository
         uses: actions/checkout@v4
 
-      - name: Deploy selected Auth app
+      - name: Validate selected Auth app source
         shell: bash
         env:
           SELECTED_APP: ${{ inputs.app }}
           SOURCE_REF: ${{ inputs.source_ref }}
-          TARGET_NODES: ${{ inputs.target_nodes }}
           SOURCE_READ_TOKEN: ${{ secrets.XN_SOURCE_READ_TOKEN }}
         run: |
           set -Eeuo pipefail
           test "$(hostname -s)" = "hungangu"
           chmod +x deploy/scripts/validate-auth-apps.sh
-          chmod +x deploy/scripts/deploy-auth-app.sh
-          chmod +x deploy/scripts/deploy-dotnet-service.sh
-          deploy/scripts/deploy-auth-app.sh
+          deploy/scripts/validate-auth-apps.sh
