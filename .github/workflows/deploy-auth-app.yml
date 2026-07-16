@@ -1,0 +1,317 @@
+name: Deploy Auth Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Auth app to deploy"
+        required: true
+        type: choice
+        options:
+          - jwt-refresh-token
+          - auth-login
+          - passkey-provider
+          - smart-otp
+          - all
+      source_ref:
+        description: "Source branch, tag, or commit SHA"
+        required: true
+        default: "main"
+        type: string
+      target_nodes:
+        description: "Target nodes: all, api-1, api-2, api-3, or comma-separated list"
+        required: true
+        default: "all"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auth-app-deploy-${{ inputs.app }}-${{ inputs.target_nodes }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64, api-deploy]
+
+    steps:
+      - name: Checkout deploy repository
+        uses: actions/checkout@v4
+
+      - name: Deploy selected Auth app
+        shell: bash
+        env:
+          SELECTED_APP: ${{ inputs.app }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          TARGET_NODES: ${{ inputs.target_nodes }}
+          SOURCE_READ_TOKEN: ${{ secrets.XN_SOURCE_READ_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          test "$(hostname -s)" = "hungangu"
+          dotnet --list-sdks | grep -Eq '^10\.'
+          chmod +x deploy/scripts/deploy-dotnet-service.sh
+
+          resolve_apps() {
+            case "$SELECTED_APP" in
+              jwt-refresh-token) echo "jwt-refresh-token" ;;
+              auth-login) echo "auth-login" ;;
+              passkey-provider) echo "passkey-provider" ;;
+              smart-otp) echo "smart-otp" ;;
+              all) echo "jwt-refresh-token auth-login passkey-provider smart-otp" ;;
+              *) echo "FAIL: invalid app: $SELECTED_APP" >&2; exit 1 ;;
+            esac
+          }
+
+          resolve_nodes() {
+            if [[ "$TARGET_NODES" = "all" ]]; then
+              echo "api-1 api-2 api-3"
+              return
+            fi
+
+            echo "$TARGET_NODES" | tr ',' ' ' | xargs -n1 | while read -r node; do
+              case "$node" in
+                api-1|api-2|api-3) echo "$node" ;;
+                *) echo "FAIL: invalid target node: $node" >&2; exit 1 ;;
+              esac
+            done | xargs
+          }
+
+          source_repo_for_app() {
+            case "$1" in
+              jwt-refresh-token) echo "XanhNow/JWT_Refresh_Token_App" ;;
+              auth-login) echo "XanhNow/Auth_Login_App" ;;
+              passkey-provider) echo "XanhNow/Passkey_Provider_App" ;;
+              smart-otp) echo "XanhNow/SmartOtp_App" ;;
+              *) exit 1 ;;
+            esac
+          }
+
+          clone_source() {
+            local repo="$1"
+            local destination="$2"
+            local url="https://github.com/${repo}.git"
+
+            if [[ -n "${SOURCE_READ_TOKEN:-}" ]]; then
+              url="https://x-access-token:${SOURCE_READ_TOKEN}@github.com/${repo}.git"
+            fi
+
+            rm -rf "$destination"
+            git init "$destination" >/dev/null
+            git -C "$destination" remote add origin "$url"
+            git -C "$destination" fetch --depth 1 origin "$SOURCE_REF"
+            git -C "$destination" checkout --detach FETCH_HEAD >/dev/null
+            git -C "$destination" remote remove origin
+          }
+
+          write_component_files() {
+            local component="$1"
+            local env_file="$2"
+            local required_file="$3"
+
+            : > "$env_file"
+            : > "$required_file"
+
+            case "$component" in
+              jwt-refresh-token)
+                cat > "$env_file" <<ENV
+Environment=Grpc__Port=5102
+Environment=Grpc__ListenLocalhost=false
+Environment=Grpc__UseTls=false
+Environment=Vault__RoleIdFile=/etc/xanhnow/jwt-refresh-token/vault/role_id
+Environment=Vault__SecretIdFile=/etc/xanhnow/jwt-refresh-token/vault/secret_id
+Environment=Vault__CaCertFile=/etc/xanhnow/jwt-refresh-token/trust/vault-ca.crt
+ENV
+                cat > "$required_file" <<REQ
+/etc/xanhnow/jwt-refresh-token/vault/role_id
+/etc/xanhnow/jwt-refresh-token/vault/secret_id
+/etc/xanhnow/jwt-refresh-token/trust/vault-ca.crt
+REQ
+                ;;
+              auth-login)
+                cat > "$env_file" <<ENV
+Environment=ASPNETCORE_URLS=http://0.0.0.0:8080
+Environment=Infrastructure__Mode=RedisVault
+Environment=Vault__RoleIdFile=/etc/xanhnow/auth-login/vault/api-role-id
+Environment=Vault__SecretIdFile=/etc/xanhnow/auth-login/vault/api-secret-id
+Environment=Vault__CaCertFile=/etc/xanhnow/auth-login/trust/vault-ca.crt
+ENV
+                cat > "$required_file" <<REQ
+/etc/xanhnow/auth-login/vault/api-role-id
+/etc/xanhnow/auth-login/vault/api-secret-id
+/etc/xanhnow/auth-login/trust/vault-ca.crt
+REQ
+                ;;
+              passkey-provider)
+                cat > "$env_file" <<ENV
+Environment=Grpc__Port=5101
+Environment=Grpc__RequireMtls=false
+Environment=Vault__RoleIdFile=/etc/xanhnow/passkey/vault/role_id
+Environment=Vault__SecretIdFile=/etc/xanhnow/passkey/vault/secret_id
+Environment=Vault__CaCertFile=/etc/xanhnow/passkey/trust/vault-ca.crt
+ENV
+                cat > "$required_file" <<REQ
+/etc/xanhnow/passkey/vault/role_id
+/etc/xanhnow/passkey/vault/secret_id
+/etc/xanhnow/passkey/trust/vault-ca.crt
+REQ
+                ;;
+              smart-otp-grpc)
+                cat > "$env_file" <<ENV
+Environment=Grpc__Port=5104
+Environment=Vault__RoleIdFile=/etc/xanhnow/auth-smart-otp/credentials/api-role-id
+Environment=Vault__SecretIdFile=/etc/xanhnow/auth-smart-otp/credentials/api-secret-id
+Environment=Vault__CaCertificatePath=/etc/xanhnow/auth-smart-otp/trust/vault-ca.crt
+ENV
+                cat > "$required_file" <<REQ
+/etc/xanhnow/auth-smart-otp/credentials/api-role-id
+/etc/xanhnow/auth-smart-otp/credentials/api-secret-id
+/etc/xanhnow/auth-smart-otp/trust/vault-ca.crt
+/etc/xanhnow/auth-smart-otp/mtls/server/smart-otp-server.crt
+/etc/xanhnow/auth-smart-otp/mtls/server/smart-otp-server.key
+/etc/xanhnow/auth-smart-otp/mtls/ca/smart-otp-grpc-client-ca.crt
+REQ
+                ;;
+              smart-otp-worker)
+                cat > "$env_file" <<ENV
+Environment=Vault__RoleIdFile=/etc/xanhnow/auth-smart-otp/credentials/worker-role-id
+Environment=Vault__SecretIdFile=/etc/xanhnow/auth-smart-otp/credentials/worker-secret-id
+Environment=Vault__CaCertificatePath=/etc/xanhnow/auth-smart-otp/trust/vault-ca.crt
+ENV
+                cat > "$required_file" <<REQ
+/etc/xanhnow/auth-smart-otp/credentials/worker-role-id
+/etc/xanhnow/auth-smart-otp/credentials/worker-secret-id
+/etc/xanhnow/auth-smart-otp/trust/vault-ca.crt
+REQ
+                ;;
+              *) echo "FAIL: unknown component: $component" >&2; exit 1 ;;
+            esac
+          }
+
+          project_for_component() {
+            case "$1" in
+              jwt-refresh-token) echo "GrpcTokenProvider.Grpc/GrpcTokenProvider.Grpc.csproj" ;;
+              auth-login) echo "src/XanhNow.Auth.Login.Api/XanhNow.Auth.Login.Api.csproj" ;;
+              passkey-provider) echo "src/XanhNow.PasskeyProvider.Grpc/XanhNow.PasskeyProvider.Grpc.csproj" ;;
+              smart-otp-grpc) echo "src/XanhNow.Auth.SmartOtp.Grpc/XanhNow.Auth.SmartOtp.Grpc.csproj" ;;
+              smart-otp-worker) echo "src/XanhNow.Auth.SmartOtp.Worker/XanhNow.Auth.SmartOtp.Worker.csproj" ;;
+              *) exit 1 ;;
+            esac
+          }
+
+          dll_for_component() {
+            case "$1" in
+              jwt-refresh-token) echo "GrpcTokenProvider.Grpc.dll" ;;
+              auth-login) echo "XanhNow.Auth.Login.Api.dll" ;;
+              passkey-provider) echo "XanhNow.PasskeyProvider.Grpc.dll" ;;
+              smart-otp-grpc) echo "XanhNow.Auth.SmartOtp.Grpc.dll" ;;
+              smart-otp-worker) echo "XanhNow.Auth.SmartOtp.Worker.dll" ;;
+              *) exit 1 ;;
+            esac
+          }
+
+          service_for_component() {
+            case "$1" in
+              jwt-refresh-token) echo "xanhnow-auth-jwt-refresh-token" ;;
+              auth-login) echo "xanhnow-auth-login" ;;
+              passkey-provider) echo "xanhnow-passkey-provider" ;;
+              smart-otp-grpc) echo "xanhnow-auth-smart-otp-grpc" ;;
+              smart-otp-worker) echo "xanhnow-auth-smart-otp-worker" ;;
+              *) exit 1 ;;
+            esac
+          }
+
+          base_for_component() {
+            case "$1" in
+              jwt-refresh-token) echo "/srv/xanhnow/apps/jwt-refresh-token" ;;
+              auth-login) echo "/srv/xanhnow/apps/auth-login" ;;
+              passkey-provider) echo "/srv/xanhnow/apps/passkey-provider" ;;
+              smart-otp-grpc) echo "/opt/xanhnow/auth-smart-otp/grpc" ;;
+              smart-otp-worker) echo "/opt/xanhnow/auth-smart-otp/worker" ;;
+              *) exit 1 ;;
+            esac
+          }
+
+          health_mode_for_component() {
+            case "$1" in
+              jwt-refresh-token) echo "http" ;;
+              auth-login) echo "http" ;;
+              passkey-provider) echo "h2c" ;;
+              smart-otp-grpc) echo "none" ;;
+              smart-otp-worker) echo "none" ;;
+              *) exit 1 ;;
+            esac
+          }
+
+          health_path_for_component() {
+            case "$1" in
+              jwt-refresh-token) echo ":5102/healthz" ;;
+              auth-login) echo ":8080/health/ready" ;;
+              passkey-provider) echo ":5101/healthz" ;;
+              smart-otp-grpc) echo ":5104/healthz" ;;
+              smart-otp-worker) echo "/" ;;
+              *) exit 1 ;;
+            esac
+          }
+
+          components_for_app() {
+            case "$1" in
+              smart-otp) echo "smart-otp-grpc smart-otp-worker" ;;
+              *) echo "$1" ;;
+            esac
+          }
+
+          APPS="$(resolve_apps)"
+          NODES="$(resolve_nodes)"
+
+          for APP in $APPS; do
+            REPO="$(source_repo_for_app "$APP")"
+            SOURCE_DIR="${RUNNER_TEMP}/source-${APP}"
+            clone_source "$REPO" "$SOURCE_DIR"
+            SOURCE_SHA="$(git -C "$SOURCE_DIR" rev-parse --verify HEAD)"
+
+            for COMPONENT in $(components_for_app "$APP"); do
+              PROJECT_FILE="$(project_for_component "$COMPONENT")"
+              APP_DLL="$(dll_for_component "$COMPONENT")"
+              SERVICE_NAME="$(service_for_component "$COMPONENT")"
+              BASE_DIR="$(base_for_component "$COMPONENT")"
+              HEALTH_MODE="$(health_mode_for_component "$COMPONENT")"
+              HEALTH_PATH="$(health_path_for_component "$COMPONENT")"
+              PUBLISH_DIR="${RUNNER_TEMP}/publish-${COMPONENT}"
+              RELEASE_ID="${COMPONENT}-${SOURCE_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              ARCHIVE="${RUNNER_TEMP}/${RELEASE_ID}.tgz"
+              ENV_FILE="${RUNNER_TEMP}/${COMPONENT}.env"
+              REQUIRED_FILE="${RUNNER_TEMP}/${COMPONENT}.required"
+
+              test -f "${SOURCE_DIR}/${PROJECT_FILE}"
+              dotnet restore "${SOURCE_DIR}/${PROJECT_FILE}"
+              dotnet build "${SOURCE_DIR}/${PROJECT_FILE}" --configuration Release --no-restore
+              rm -rf "$PUBLISH_DIR"
+              dotnet publish "${SOURCE_DIR}/${PROJECT_FILE}" --configuration Release --no-build --output "$PUBLISH_DIR"
+              test -f "${PUBLISH_DIR}/${APP_DLL}"
+
+              tar --sort=name --owner=0 --group=0 --numeric-owner -C "$PUBLISH_DIR" -czf "$ARCHIVE" .
+              test -s "$ARCHIVE"
+              SHA256="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+              write_component_files "$COMPONENT" "$ENV_FILE" "$REQUIRED_FILE"
+
+              for NODE in $NODES; do
+                deploy/scripts/deploy-dotnet-service.sh \
+                  --node "$NODE" \
+                  --archive "$ARCHIVE" \
+                  --sha256 "$SHA256" \
+                  --release-id "$RELEASE_ID" \
+                  --service-name "$SERVICE_NAME" \
+                  --app-dll "$APP_DLL" \
+                  --base-dir "$BASE_DIR" \
+                  --health-mode "$HEALTH_MODE" \
+                  --health-path "$HEALTH_PATH" \
+                  --service-env-file "$ENV_FILE" \
+                  --required-files-file "$REQUIRED_FILE" \
+                  --source-repository "$REPO" \
+                  --source-ref "$SOURCE_REF" \
+                  --source-sha "$SOURCE_SHA"
+              done
+            done
+          done
